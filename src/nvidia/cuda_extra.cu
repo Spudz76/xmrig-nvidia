@@ -530,6 +530,7 @@ int cuda_get_deviceinfo(nvid_ctx* ctx, xmrig::Algo algo, bool isCNv2)
 
     const int GPU_N = cuda_get_devicecount();
     if (GPU_N == 0) {
+        printf("Zero device count!\n");
         return 1;
     }
 
@@ -560,6 +561,20 @@ int cuda_get_deviceinfo(nvid_ctx* ctx, xmrig::Algo algo, bool isCNv2)
     ctx->device_memoryFree = freeMemory;
     ctx->device_memoryTotal = totalMemory;
 
+    constexpr size_t byteToMiB = 1024u * 1024u;
+    // keep 128MiB memory free (value is randomly chosen)
+    // 200byte are meta data memory (result nonce, ...)
+    const size_t availableMem  = freeMemory - (128u * byteToMiB) - 200u;
+    const size_t hashMemSize = xmrig::cn_select_memory(algo);
+    // up to 16kibyte extra memory is used per thread for some kernel (lmem/local memory)
+    // 680bytes are extra meta data memory per hash
+    size_t perThread = hashMemSize + 16192u + 680u;
+    if (algo == xmrig::CRYPTONIGHT_HEAVY) {
+        perThread += 50 * 4; // state double buffer
+    }
+    size_t maxMemUsage = size_t(2048u) * byteToMiB;
+    size_t limitedMemory = std::min(availableMem, maxMemUsage);
+
     cudaDeviceProp props;
     err = cudaGetDeviceProperties(&props, ctx->device_id);
     if (err != cudaSuccess) {
@@ -577,110 +592,151 @@ int cuda_get_deviceinfo(nvid_ctx* ctx, xmrig::Algo algo, bool isCNv2)
     ctx->device_pciDeviceID     = props.pciDeviceID;
     ctx->device_pciDomainID     = props.pciDomainID;
 
+    /* good values based of my experience
+     *   - 3 * SMX count >=sm_30
+     *   - 2 * SMX count < sm_30
+    */
+    int autoBlocks  = props.multiProcessorCount * (props.major < 3 ? 2 : 3);
+    /*
+    * `cryptonight_core_gpu_phase1` and `cryptonight_core_gpu_phase3` starts
+    * `8 * ctx->device_threads` threads per block
+    // use only odd number of threads
+    */
+    int autoThreads = int(limitedMemory / perThread / autoBlocks) & 0xFFFFFFFE;
+    if (isCNv2 && props.major < 6) {
+        // 4 based on my test maybe it must be adjusted later
+        int threads = 4;
+        // 8 is chosen by checking the occupancy calculator
+        if (8 * ctx->device_mpcount * threads * hashMemSize < limitedMemory) {
+            ctx->device_threads = threads;
+            ctx->device_blocks = 8 * ctx->device_mpcount;
+        }
+    }
+
+    int autoBfactor = 6;
+    if (props.multiProcessorCount <= 6) {
+        // increase bfactor for low end devices to avoid TDR kill
+        autoBfactor = 8;
+    }
+
+    if (props.major == 2) {
+        maxMemUsage = size_t(1024u) * byteToMiB;
+        limitedMemory = std::min(availableMem, maxMemUsage);
+        autoThreads = int(limitedMemory / perThread / autoBlocks) & 0xFFFFFFFE;
+        if (autoThreads > 64) {
+            // Fermi gpus only support 512 threads per block (we need start 4 * configured threads)
+            printf("WARNING: NVIDIA GPU %d: Fermi autoThreads limited to 64 from %d.\n", ctx->device_id, autoThreads);
+            autoThreads = 64;
+        }
+        if (isCNv2) {
+            // 12x26 based on my test maybe it must be adjusted later
+            if (6 * 13 * ctx->device_mpcount * hashMemSize < limitedMemory) {
+                autoThreads =  6 * ctx->device_mpcount;
+                autoBlocks  = 13 * ctx->device_mpcount;
+            }
+        }
+        ctx->device_cCores  = 32;
+        ctx->device_cSFUs   =  4;
+        ctx->device_cScheds =  2;
+        ctx->device_cIPS    =  1;
+        if (props.minor == 1) {
+            ctx->device_cCores += 16; // 48
+            ctx->device_cSFUs  +=  4; //  8
+            ctx->device_cIPS   +=  1; //  2
+        }
+    }
+    if (props.major == 3) {
+        ctx->device_cCores  = 192;
+        ctx->device_cSFUs   =  32;
+        ctx->device_cScheds =   4;
+        ctx->device_cIPS    =   2;
+    }
+    if (props.major == 5) {
+        ctx->device_cCores  = 128   ;
+        ctx->device_cSFUs   =  32;
+        ctx->device_cScheds =   4;
+        ctx->device_cIPS    =   1;
+    }
+    if (props.major == 6) {
+        if (props.multiProcessorCount >= 15 && props.multiProcessorCount <= 20) {
+            maxMemUsage = size_t(4096u) * byteToMiB; // GTX1070, GTX1080
+            limitedMemory = std::min(availableMem, maxMemUsage);
+            autoThreads = int(limitedMemory / perThread / autoBlocks) & 0xFFFFFFFE;
+        }
+        ctx->device_cCores  = 64;
+        ctx->device_cSFUs   = 16;
+        ctx->device_cScheds =  2;
+        ctx->device_cIPS    =  1;
+        if (props.minor == 1 || props.minor == 2) {
+            ctx->device_cCores  += 64; // 128
+            ctx->device_cSFUs   += 16; //  32
+            ctx->device_cScheds +=  2; //   4
+        }
+    }
+
+    /* We use in windows bfactor (split slow kernel into smaller parts) to avoid
+    * that windows is killing long running kernel.
+    * In the case there is already memory used on the gpu than we
+    * assume that other application are running between the split kernel,
+    * this can result into TLB memory flushes and can strongly reduce the performance
+    * and the result can be that windows is killing the miner.
+    * Be reducing maxMemUsage we try to avoid this effect.
+    */
+    size_t usedMem = totalMemory - freeMemory;
+    if (usedMem >= maxMemUsage) {
+        printf("WARNING: NVIDIA GPU %d: already %zu MiB memory in use, skip GPU.\n", ctx->device_id, usedMem / byteToMiB);
+
+        return 4;
+    }
+    else {
+        printf("WARNING: NVIDIA GPU %d: already %zu MiB memory in use, adjusting maxMemUsage.\n", ctx->device_id, usedMem / byteToMiB);
+        maxMemUsage -= usedMem;
+        limitedMemory = std::min(availableMem, maxMemUsage);
+        autoThreads = int(limitedMemory / perThread / autoBlocks) & 0xFFFFFFFE;
+    }
+
+    printf("GPU %d: Bwidth:%d Mtg:%zu SMsmx:%zu SMb:%zu MMU:%zu\n", ctx->device_id,
+           props.memoryBusWidth,
+           props.totalGlobalMem / byteToMiB,
+           props.sharedMemPerMultiprocessor / byteToMiB,
+           props.sharedMemPerBlock / byteToMiB,
+           maxMemUsage / byteToMiB
+    );
+    printf("GPU %d: Tsmx:%d Tb:%d Cores:%d SFUs:%d Scheds:%dx%d\n", ctx->device_id,
+           props.maxThreadsPerMultiProcessor,
+           props.maxThreadsPerBlock,
+           ctx->device_cCores,
+           ctx->device_cSFUs,
+           ctx->device_cScheds,
+           ctx->device_cIPS
+    );
+    printf("GPU %d: AutoX:%d Y:%d Z:%d Size:%d\n", ctx->device_id,
+           autoBlocks, autoThreads * 16, autoThreads * 16 * 36,
+           autoBlocks * autoThreads * 16 * autoThreads * 16 * 36
+    );
     // set all device option those marked as auto (-1) to a valid value
     if (ctx->device_blocks == -1) {
-        /* good values based of my experience
-         *   - 3 * SMX count >=sm_30
-         *   - 2 * SMX count for <sm_30
-         */
-        ctx->device_blocks = props.multiProcessorCount * (props.major < 3 ? 2 : 3);
-
-        // increase bfactor for low end devices to avoid that the miner is killed by the OS
-#       ifdef _WIN32
-        if (props.multiProcessorCount <= 6 && ctx->device_bfactor == 6) {
-            ctx->device_bfactor = 8;
-        }
-#       endif
+        ctx->device_blocks = autoBlocks;
     }
-
     if (ctx->device_threads == -1) {
-        /* sm_20 devices can only run 512 threads per cuda block
-        * `cryptonight_core_gpu_phase1` and `cryptonight_core_gpu_phase3` starts
-        * `8 * ctx->device_threads` threads per block
-        */
-        ctx->device_threads = 64;
-        constexpr size_t byteToMiB = 1024u * 1024u;
-
-        // no limit by default 1TiB
-        size_t maxMemUsage = byteToMiB * byteToMiB;
-        if (props.major == 6) {
-            if (props.multiProcessorCount < 15) {
-                // limit memory usage for GPUs for pascal < GTX1070
-                maxMemUsage = size_t(2048u) * byteToMiB;
-            }
-            else if (props.multiProcessorCount <= 20) {
-                // limit memory usage for GPUs for pascal GTX1070, GTX1080
-                maxMemUsage = size_t(4096u) * byteToMiB;
-            }
-        }
-
-        if (props.major < 6) {
-            // limit memory usage for GPUs before pascal
-            maxMemUsage = size_t(2048u) * byteToMiB;
-        }
-
-        if (props.major == 2) {
-            // limit memory usage for sm 20 GPUs
-            maxMemUsage = size_t(1024u) * byteToMiB;
-        }
-
-        const size_t hashMemSize = xmrig::cn_select_memory(algo);
-#       ifdef _WIN32
-        /* We use in windows bfactor (split slow kernel into smaller parts) to avoid
-        * that windows is killing long running kernel.
-        * In the case there is already memory used on the gpu than we
-        * assume that other application are running between the split kernel,
-        * this can result into TLB memory flushes and can strongly reduce the performance
-        * and the result can be that windows is killing the miner.
-        * Be reducing maxMemUsage we try to avoid this effect.
-        */
-        size_t usedMem = totalMemory - freeMemory;
-        if (usedMem >= maxMemUsage) {
-            printf("WARNING: NVIDIA GPU %d: already %zu MiB memory in use, skip GPU.\n", ctx->device_id, usedMem / byteToMiB);
-
-            return 4;
-        }
-        else {
-            maxMemUsage -= usedMem;
-        }
-#       endif
-
-        // keep 128MiB memory free (value is randomly chosen)
-        // 200byte are meta data memory (result nonce, ...)
-        const size_t availableMem  = freeMemory - (128u * byteToMiB) - 200u;
-        const size_t limitedMemory = std::min(availableMem, maxMemUsage);
-        // up to 16kibyte extra memory is used per thread for some kernel (lmem/local memory)
-        // 680bytes are extra meta data memory per hash
-        size_t perThread = hashMemSize + 16192u + 680u;
-
-        if (algo == xmrig::CRYPTONIGHT_HEAVY) {
-            perThread += 50 * 4; // state double buffer
-        }
-
-        const size_t max_intensity = limitedMemory / perThread;
-
-        ctx->device_threads  = max_intensity / ctx->device_blocks;
-        // use only odd number of threads
-        ctx->device_threads = ctx->device_threads & 0xFFFFFFFE;
-
-        if (props.major == 2 && ctx->device_threads > 64) {
-            // Fermi gpus only support 512 threads per block (we need start 4 * configured threads)
-            ctx->device_threads = 64;
-        }
-
-        if (isCNv2 && props.major < 6) {
-            // 4 based on my test maybe it must be adjusted later
-            size_t threads = 4;
-            // 8 is chosen by checking the occupancy calculator
-            size_t blockOptimal = 8 * ctx->device_mpcount;
-
-            if (blockOptimal * threads * hashMemSize < limitedMemory) {
-                ctx->device_threads = threads;
-                ctx->device_blocks = blockOptimal;
-            }
-        }
-
+        ctx->device_threads = autoThreads;
     }
+    if (ctx->device_bfactor == -1) {
+        ctx->device_bfactor = autoBfactor;
+    }
+
+/*
+1. The maximum number of threads in the block is limited to 1024. This is the product of whatever your threadblock dimensions are (x*y*z). For example (32,32,1) creates a block of 1024 threads. (33,32,1) is not legal, since 33*32*1 > 1024.
+4. The maximum z-dimension is 64. (1,1,64) is legal. (2,2,64) is also legal. (1,1,65) is not legal.
+*/
+    // <<<ctx->device_blocks, ctx->device_threads * 16,  36 * 16 * ctx->device_threads>>>
+    int gridX = ctx->device_blocks;
+    int gridY = ctx->device_threads * 16;
+    int gridZ = gridY * 36;
+    int gridSize = gridX * gridY * gridZ;
+    printf("GPU %d: GridX:%d Y:%d Z:%d Size:%d\n", ctx->device_id,
+           gridX, gridY, gridZ, gridSize
+    );
 
     return 0;
 }
