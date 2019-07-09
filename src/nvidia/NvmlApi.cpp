@@ -30,7 +30,7 @@
 
 
 static uv_lib_t nvmlLib;
-static char nvmlVerion[80] = { 0 };
+static char nvmlVersion[NVML_SYSTEM_NVML_VERSION_BUFFER_SIZE] = { 0 };
 
 
 bool NvmlApi::m_available = false;
@@ -50,8 +50,8 @@ static nvmlReturn_t(*pNvmlDeviceGetPciInfo)(nvmlDevice_t device, nvmlPciInfo_t *
 bool NvmlApi::init()
 {
 #   ifdef _WIN32
-    char tmp[512];
-    ExpandEnvironmentStringsA("%PROGRAMFILES%\\NVIDIA Corporation\\NVSMI\\nvml.dll", tmp, sizeof(tmp));
+    char tmp[261]; //LoadLibrary calls are still "260 char" limited
+    ExpandEnvironmentStringsA(R"(%ProgramFiles%\NVIDIA Corporation\NVSMI\nvml.dll)", tmp, sizeof(tmp));
     if (uv_dlopen(tmp, &nvmlLib) == -1 && uv_dlopen("nvml.dll", &nvmlLib) == -1) {
         return false;
     }
@@ -78,7 +78,7 @@ bool NvmlApi::init()
     m_available = pNvmlInit() == NVML_SUCCESS;
 
     if (pNvmlSystemGetNVMLVersion) {
-        pNvmlSystemGetNVMLVersion(nvmlVerion, sizeof(nvmlVerion));
+        pNvmlSystemGetNVMLVersion(nvmlVersion, sizeof(nvmlVersion));
     }
 
     return m_available;
@@ -95,34 +95,52 @@ void NvmlApi::release()
 }
 
 
-bool NvmlApi::health(int id, Health &health)
+bool NvmlApi::health(int i, Health &health)
 {
-    if (id == -1 || !isAvailable()) {
+    const auto id = static_cast<unsigned int>(i);
+    nvmlDevice_t device;
+
+    if (i == -1 || !isAvailable()
+        ||
+        (pNvmlDeviceGetHandleByIndex && pNvmlDeviceGetHandleByIndex(id, &device) != NVML_SUCCESS)
+    ) {
         return false;
     }
+
+    // cache items previously pegged as unavailable via function call failure
+    // this has to happen before the reset or we don't see the previous value
+    const bool hasPowerUsage = U32MARKER != health.power;
+    const bool hasFanSpeed   = U32MARKER != health.fanSpeed;
+    const bool hasClockInfo  = U32MARKER != health.clock;
 
     health.reset();
-
-    nvmlDevice_t device;
-    if (pNvmlDeviceGetHandleByIndex && pNvmlDeviceGetHandleByIndex(id, &device) != NVML_SUCCESS) {
-        return false;
-    }
 
     if (pNvmlDeviceGetTemperature) {
         pNvmlDeviceGetTemperature(device, NVML_TEMPERATURE_GPU, &health.temperature);
     }
 
     if (pNvmlDeviceGetPowerUsage) {
-        pNvmlDeviceGetPowerUsage(device, &health.power);
+        if (!hasPowerUsage || pNvmlDeviceGetPowerUsage(device, &health.power) != NVML_SUCCESS){
+            health.power = U32MARKER;
+        }
     }
 
     if (pNvmlDeviceGetFanSpeed) {
-        pNvmlDeviceGetFanSpeed(device, &health.fanSpeed);
+        if (!hasFanSpeed || pNvmlDeviceGetFanSpeed(device, &health.fanSpeed) != NVML_SUCCESS){
+            health.fanSpeed = U32MARKER;
+        }
     }
 
     if (pNvmlDeviceGetClockInfo) {
-        pNvmlDeviceGetClockInfo(device, NVML_CLOCK_SM, &health.clock);
-        pNvmlDeviceGetClockInfo(device, NVML_CLOCK_MEM, &health.memClock);
+        if (!hasClockInfo
+            ||
+            pNvmlDeviceGetClockInfo(device, NVML_CLOCK_SM, &health.clock) != NVML_SUCCESS
+            ||
+            pNvmlDeviceGetClockInfo(device, NVML_CLOCK_MEM, &health.memClock) != NVML_SUCCESS
+        ) {
+            health.clock = U32MARKER;
+            health.memClock = U32MARKER;
+        }
     }
 
     return true;
@@ -131,7 +149,7 @@ bool NvmlApi::health(int id, Health &health)
 
 const char *NvmlApi::version()
 {
-    return nvmlVerion;
+    return nvmlVersion;
 }
 
 

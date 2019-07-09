@@ -44,6 +44,10 @@ typedef struct {
     const char *device_name;
     int device_arch[2];
     int device_mpcount;
+    int device_cCores;
+    int device_cSFUs;
+    int device_cScheds;
+    int device_cIPS;
     int device_blocks;
     int device_threads;
     int device_bfactor;

@@ -521,6 +521,7 @@ int cuda_get_deviceinfo(nvid_ctx* ctx, xmrig::Algo algo, bool isCNv2)
 
     const int GPU_N = cuda_get_devicecount();
     if (GPU_N == 0) {
+        printf("Zero device count!\n");
         return 1;
     }
 
@@ -528,6 +529,20 @@ int cuda_get_deviceinfo(nvid_ctx* ctx, xmrig::Algo algo, bool isCNv2)
         printf("Invalid device ID!\n");
         return 1;
     }
+
+    constexpr size_t byteToMiB = 1024u * 1024u;
+    // keep 128MiB memory free (value is randomly chosen)
+    // 200byte are meta data memory (result nonce, ...)
+    const size_t availableMem  = freeMemory - (128u * byteToMiB) - 200u;
+    const size_t hashMemSize = xmrig::cn_select_memory(algo);
+    // up to 16kibyte extra memory is used per thread for some kernel (lmem/local memory)
+    // 680bytes are extra meta data memory per hash
+    size_t perThread = hashMemSize + 16192u + 680u;
+    if (algo == xmrig::CRYPTONIGHT_HEAVY) {
+        perThread += 50 * 4; // state double buffer
+    }
+    size_t maxMemUsage = size_t(2048u) * byteToMiB;
+    size_t limitedMemory = std::min(availableMem, maxMemUsage);
 
     cudaDeviceProp props;
     err = cudaGetDeviceProperties(&props, ctx->device_id);

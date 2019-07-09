@@ -86,6 +86,8 @@ CudaThread::CudaThread(const rapidjson::Value &object) :
     m_threads(0),
     m_affinity(-1),
     m_index(0),
+    m_memoryFree(0),
+    m_memoryTotal(0),
     m_threadId(0),
     m_pciBusID(0),
     m_pciDeviceID(0),

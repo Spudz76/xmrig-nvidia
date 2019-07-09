@@ -27,6 +27,7 @@
 
 #include <stdint.h>
 
+#define U32MARKER 0xDEADC0DE
 
 class Health
 {
